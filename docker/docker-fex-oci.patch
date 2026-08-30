@@ -1,0 +1,26 @@
+diff --git a/Dockerfile b/Dockerfile
+index 93c738e..528249b 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -51,8 +51,10 @@ USER fex
+ WORKDIR /home/fex
+ 
+ # Clone the FEX repository and build it
+-RUN git clone --recurse-submodules https://github.com/FEX-Emu/FEX.git && \
++RUN git clone https://github.com/FEX-Emu/FEX.git && \
+     cd FEX && \
++    git checkout a08a6ce && \
++    git submodule update --init --recursive && \
+     mkdir Build && \
+     cd Build && \
+     CC=clang CXX=clang++ cmake -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DUSE_LINKER=lld -DENABLE_LTO=True -DBUILD_TESTS=False -DENABLE_ASSERTIONS=False -G Ninja .. && \
+@@ -74,6 +76,9 @@ RUN echo 'root:steamcmd' | chpasswd
+ 
+ RUN echo 'steam:steamcmd' | chpasswd
+ 
++RUN mkdir -p /home/steam/.fex-emu/RootFS /home/steam/Steam /home/steam/Zomboid && \
++    chown -R steam:steam /home/steam/.fex-emu /home/steam/Steam /home/steam/Zomboid
++
+ USER steam
+ 
+ WORKDIR /home/steam/.fex-emu/RootFS/
