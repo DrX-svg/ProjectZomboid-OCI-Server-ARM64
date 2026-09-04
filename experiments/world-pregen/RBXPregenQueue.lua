@@ -1,11 +1,13 @@
 local USER = "PregenBOT"
+local MODULE = "RBXPregen"
 
 local QUEUE_FILE = "RBXPregen_queue.txt"
 local CONTROL_FILE = "RBXPregen_control.txt"
 local CHECKPOINT_FILE = "RBXPregen_checkpoint.txt"
 local STATUS_FILE = "RBXPregen_status.txt"
 
-local INTERVAL_MS = 8000
+local DWELL_MS = 8000
+local TIMEOUT_MS = 20000
 
 local queue = {}
 local index = 1
@@ -16,7 +18,8 @@ local runCount = 0
 local runLimit = nil
 
 local initialized = false
-local lastTeleport = 0
+local pending = nil
+local nextAllowed = 0
 local lastControlCheck = 0
 
 
@@ -26,37 +29,56 @@ end
 
 
 local function readLines(name)
-    local ok, reader = pcall(function()
+    local ok, r = pcall(function()
         return getFileReader(name, false)
     end)
 
-    if not ok or not reader then
+    if not ok or not r then
         return nil
     end
 
     local lines = {}
 
     while true do
-        local line = reader:readLine()
+        local line = r:readLine()
         if not line then break end
         table.insert(lines, tostring(line))
     end
 
-    reader:close()
+    r:close()
     return lines
 end
 
 
 local function writeFile(name, text)
-    local writer = getFileWriter(name, true, false)
-    writer:write(text)
-    writer:close()
+    local w = getFileWriter(name, true, false)
+    w:write(text)
+    w:close()
+end
+
+
+local function findPlayer()
+    local players = getOnlinePlayers()
+
+    if not players then
+        return nil
+    end
+
+    for i = 0, players:size() - 1 do
+        local p = players:get(i)
+
+        if p and p:getUsername() == USER then
+            return p
+        end
+    end
+
+    return nil
 end
 
 
 local function setControl(value)
-    writeFile(CONTROL_FILE, value .. "\n")
     control = value
+    writeFile(CONTROL_FILE, value .. "\n")
 end
 
 
@@ -67,14 +89,13 @@ local function readControl()
         return "pause"
     end
 
-    local value =
-        tostring(lines[1]):lower():match("^%s*(.-)%s*$")
+    local v = tostring(lines[1]):lower():match("^%s*(.-)%s*$")
 
-    if value == "run" or
-       value == "run1" or
-       value == "run20" or
-       value == "done" then
-        return value
+    if v == "run" or
+       v == "run1" or
+       v == "run20" or
+       v == "done" then
+        return v
     end
 
     return "pause"
@@ -106,29 +127,9 @@ local function loadCheckpoint()
 end
 
 
-local function findPregenPlayer()
-    local players = getOnlinePlayers()
-
-    if not players then
-        return nil
-    end
-
-    for i = 0, players:size() - 1 do
-        local player = players:get(i)
-
-        if player and player:getUsername() == USER then
-            return player
-        end
-    end
-
-    return nil
-end
-
-
 local function writeStatus(reason, x, y, err)
     writeFile(
         STATUS_FILE,
-
         "reason=" .. tostring(reason) .. "\n" ..
         "control=" .. tostring(control) .. "\n" ..
         "index=" .. tostring(index) .. "\n" ..
@@ -136,8 +137,8 @@ local function writeStatus(reason, x, y, err)
         "teleports=" .. tostring(teleports) .. "\n" ..
         "target_x=" .. tostring(x or "") .. "\n" ..
         "target_y=" .. tostring(y or "") .. "\n" ..
-        "player_online=" ..
-            tostring(findPregenPlayer() ~= nil) .. "\n" ..
+        "player_online=" .. tostring(findPlayer() ~= nil) .. "\n" ..
+        "pending=" .. tostring(pending ~= nil) .. "\n" ..
         "error=" .. tostring(err or "") .. "\n" ..
         "updated_epoch=" .. tostring(getTimestamp()) .. "\n"
     )
@@ -148,7 +149,7 @@ local function initialize()
     local lines = readLines(QUEUE_FILE)
 
     if not lines then
-        log("ERROR: queue file unavailable")
+        log("ERROR queue unavailable")
         return false
     end
 
@@ -165,14 +166,11 @@ local function initialize()
     end
 
     if #queue == 0 then
-        log("ERROR: queue is empty")
+        log("ERROR queue empty")
         return false
     end
 
     loadCheckpoint()
-
-    if index < 1 then index = 1 end
-    if index > #queue + 1 then index = #queue + 1 end
 
     initialized = true
 
@@ -188,27 +186,119 @@ local function initialize()
 end
 
 
-local function teleportPlayer(player, x, y)
-    local ok, err = pcall(function()
+local function onClientCommand(module, command, player, args)
+    if module ~= MODULE then return end
+    if not player then return end
+    if player:getUsername() ~= USER then return end
+    if not pending then return end
+    if not args then return end
 
-        if player.teleportTo then
-            player:teleportTo(
-                x + 0.5,
-                y + 0.5,
-                0
-            )
-        else
-            player:setX(x + 0.5)
-            player:setY(y + 0.5)
-            player:setZ(0)
-        end
+    local ackIndex = tonumber(args.index)
 
-        if teleportPlayers then
-            teleportPlayers(player)
-        end
-    end)
+    if ackIndex ~= pending.index then
+        return
+    end
 
-    return ok, err
+    if command == "failed" then
+        local x = pending.x
+        local y = pending.y
+
+        pending = nil
+        setControl("pause")
+
+        writeStatus(
+            "client-failed",
+            x,
+            y,
+            "client did not reach target"
+        )
+
+        log(
+            "FAILED index=" ..
+            tostring(ackIndex)
+        )
+
+        return
+    end
+
+    if command ~= "ack" then
+        return
+    end
+
+    local actualX = player:getX()
+    local actualY = player:getY()
+
+    local dx = math.abs(actualX - pending.x)
+    local dy = math.abs(actualY - pending.y)
+
+    if dx > 8 or dy > 8 then
+        local x = pending.x
+        local y = pending.y
+
+        pending = nil
+        setControl("pause")
+
+        writeStatus(
+            "server-position-mismatch",
+            x,
+            y,
+            "server player position did not match ACK"
+        )
+
+        log(
+            "POSITION MISMATCH actual=" ..
+            tostring(actualX) .. "," ..
+            tostring(actualY)
+        )
+
+        return
+    end
+
+    local completedIndex = pending.index
+    local targetX = pending.x
+    local targetY = pending.y
+
+    pending = nil
+
+    teleports = teleports + 1
+    index = index + 1
+    runCount = runCount + 1
+
+    saveCheckpoint()
+
+    log(
+        "VALIDATED index=" ..
+        tostring(completedIndex) ..
+        " target=" ..
+        tostring(targetX) .. "," ..
+        tostring(targetY) ..
+        " actual=" ..
+        tostring(actualX) .. "," ..
+        tostring(actualY)
+    )
+
+    nextAllowed = getTimestampMs() + DWELL_MS
+
+    if runLimit and runCount >= runLimit then
+        setControl("pause")
+
+        writeStatus(
+            "test-complete",
+            targetX,
+            targetY
+        )
+
+        log(
+            "test complete count=" ..
+            tostring(runCount)
+        )
+    else
+        writeStatus(
+            "validated",
+            targetX,
+            targetY
+        )
+    end
 end
 
 
@@ -216,12 +306,10 @@ local function onTick()
     local now = getTimestampMs()
 
     if not initialized then
-        if not initialize() then
-            return
-        end
+        if not initialize() then return end
     end
 
-    if now - lastControlCheck >= 2000 then
+    if now - lastControlCheck >= 1000 then
         lastControlCheck = now
 
         local newControl = readControl()
@@ -248,15 +336,38 @@ local function onTick()
         return
     end
 
-    local player =
-        findPregenPlayer()
+    if pending then
+        if now - pending.sentMs > TIMEOUT_MS then
+            local x = pending.x
+            local y = pending.y
+            local i = pending.index
 
-    if not player then
-        writeStatus("waiting-for-player")
+            pending = nil
+            setControl("pause")
+
+            writeStatus(
+                "timeout",
+                x,
+                y,
+                "no client ACK"
+            )
+
+            log(
+                "TIMEOUT index=" ..
+                tostring(i)
+            )
+        end
+
         return
     end
 
-    if now - lastTeleport < INTERVAL_MS then
+    if now < nextAllowed then
+        return
+    end
+
+    local player = findPlayer()
+
+    if not player then
         return
     end
 
@@ -275,75 +386,63 @@ local function onTick()
 
     local target = queue[index]
 
-    local ok, err =
-        teleportPlayer(
+    pending = {
+        index = index,
+        x = target.x,
+        y = target.y,
+        sentMs = now
+    }
+
+    local ok, err = pcall(function()
+        sendServerCommand(
             player,
-            target.x,
-            target.y
+            MODULE,
+            "teleport",
+            {
+                index = index,
+                x = target.x,
+                y = target.y,
+                z = 0
+            }
         )
+    end)
 
     if not ok then
+        pending = nil
         setControl("pause")
 
         writeStatus(
-            "teleport-error",
+            "send-error",
             target.x,
             target.y,
             err
         )
 
         log(
-            "ERROR target=" ..
-            tostring(target.x) .. "," ..
-            tostring(target.y) ..
-            " " .. tostring(err)
+            "SEND ERROR: " ..
+            tostring(err)
         )
 
         return
     end
 
-    lastTeleport = now
-    teleports = teleports + 1
-    runCount = runCount + 1
-    index = index + 1
-
-    saveCheckpoint()
-
     writeStatus(
-        "teleported",
+        "sent",
         target.x,
         target.y
     )
 
-    if teleports % 10 == 0 then
-        log(
-            "progress " ..
-            tostring(teleports) ..
-            "/" ..
-            tostring(#queue) ..
-            " last=" ..
-            tostring(target.x) .. "," ..
-            tostring(target.y)
-        )
-    end
-
-    if runLimit and runCount >= runLimit then
-        setControl("pause")
-
-        writeStatus(
-            "test-complete",
-            target.x,
-            target.y
-        )
-
-        log(
-            "test complete count=" ..
-            tostring(runCount)
-        )
-    end
+    log(
+        "SENT index=" ..
+        tostring(index) ..
+        " target=" ..
+        tostring(target.x) .. "," ..
+        tostring(target.y)
+    )
 end
 
 
+Events.OnClientCommand.Add(onClientCommand)
 Events.OnTick.Add(onTick)
 
-log("loaded; waiting for pause/run1/run20/run")
+log("ACK controller loaded")
