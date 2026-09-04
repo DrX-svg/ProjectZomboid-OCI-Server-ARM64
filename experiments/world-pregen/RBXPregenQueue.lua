@@ -395,7 +395,6 @@ local function onTick()
 
     local ok, err = pcall(function()
         sendServerCommand(
-            player,
             MODULE,
             "teleport",
             {
