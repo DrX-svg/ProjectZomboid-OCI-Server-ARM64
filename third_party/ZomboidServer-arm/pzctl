@@ -1,0 +1,732 @@
+#!/usr/bin/env bash
+#
+#  pzctl — interactive control panel for the Project Zomboid B42 (ARM/box64) server.
+#  Run it as your normal user:   pzctl
+#
+#  Point PZCTL_ENV at an alternate env file to drive a non-default install
+#  (side-by-side test servers etc.). Everything else comes from that env file.
+#
+set -uo pipefail
+
+PZCTL_VERSION="2.2.0"
+
+# ------------------------------------------------------------ config (from installer)
+ENVF="${PZCTL_ENV:-/etc/zomboid-b42.env}"; [ -f "$ENVF" ] && . "$ENVF"
+. "${PZ_COMMON:-/usr/local/lib/zomboid-arm/common.sh}"
+pz_load_env
+PZ_MODUPDATE="${PZ_MODUPDATE:-/usr/local/sbin/pz-modupdate}"
+
+pause() { printf '\n'; read -rp "$(bold 'Press Enter to continue...')" _ || true; }
+
+status_line() {
+  local act lis
+  act=$(sudo systemctl is-active "$PZ_SERVICE" 2>/dev/null)
+  if is_listening; then lis="$(grn 'LISTENING (players can join)')"
+  elif [ "$act" = active ]; then lis="$(ylw 'booting / not yet listening')"
+  else lis="$(red 'stopped')"; fi
+  printf '  service: %s    state: %s\n' "$act" "$lis"
+}
+
+# ------------------------------------------------------------ start / stop / restart
+run_boot_retry() { PZ_SERVICE="$PZ_SERVICE" PZ_PORT="$PZ_PORT" PZ_CONSOLE="$PZ_CONSOLE" "$PZ_BOOTRETRY"; }
+
+do_start() {
+  echo "Bringing the server up (box64 boot is flaky — auto-retries until it listens)..."
+  run_boot_retry
+  pause
+}
+do_stop() { sudo systemctl stop "$PZ_SERVICE"; echo "$(ylw Stopped)."; pause; }
+do_restart() {
+  if [ "$(conf_get MODUPDATE_ON_RESTART 0)" = 1 ]; then
+    echo "Checking workshop mods for updates first (toggle in menu 12)..."
+    "$PZ_MODUPDATE" check; rc=$?
+    if [ "$rc" -eq 10 ]; then "$PZ_MODUPDATE" apply --no-restart; fi
+  fi
+  echo "Restarting..."
+  run_boot_retry
+  pause
+}
+
+# ------------------------------------------------------------ status / logs
+do_status() {
+  echo; status_line; echo
+  echo "$(bold 'Uptime:')      $(sudo systemctl show "$PZ_SERVICE" -p ActiveEnterTimestamp --value 2>/dev/null)"
+  echo "$(bold 'Public IP:')   $(curl -fsSL --max-time 4 ifconfig.me 2>/dev/null || echo '?'):$PZ_PORT"
+  echo "$(bold 'Branch:')      ${PZ_BRANCH}"
+  echo "$(bold 'Scripts:')     pzctl v$PZCTL_VERSION"
+  echo "$(bold 'Version:')     $(grep -am1 -oE 'version=[0-9][0-9.]*' "$PZ_CONSOLE" 2>/dev/null | cut -d= -f2 || echo '?')"
+  local mlist; mlist="$(mods_get)"
+  echo "$(bold 'Active mods:') $( [ -n "$mlist" ] && awk -F';' '{print NF}' <<< "$mlist" || echo 0 ) mods"
+  echo "$(bold 'RAM (-Xmx):')  $(grep -oE '"-Xmx[0-9]+g"' "$PZ_JSON" 2>/dev/null | tr -d '"-')"
+  echo
+  echo "$(bold 'Directories & files:')"
+  printf '  %-14s %s\n' \
+    "server files"  "$PZ_INSTALL" \
+    "game data"     "$PZ_CACHEDIR" \
+    "server ini"    "$PZ_INI" \
+    "sandbox lua"   "$PZ_CACHEDIR/Server/${PZ_SERVERNAME}_SandboxVars.lua" \
+    "saves"         "$PZ_CACHEDIR/Saves" \
+    "local mods"    "$PZ_MODS" \
+    "workshop dir"  "$PZ_WS" \
+    "console log"   "$PZ_CONSOLE" \
+    "backups"       "$PZ_BACKUPS" \
+    "mod updates"   "$PZ_UPDATELOG" \
+    "downloader"    "$PZ_DDLOG" \
+    "env file"      "$ENVF"
+  echo; echo "$(bold 'Last console lines:')"
+  tail -n 6 "$PZ_CONSOLE" 2>/dev/null | sed 's/^/  /'
+  pause
+}
+
+do_logs() {
+  echo "Live server log — $(ylw 'Ctrl+C to return to the menu')."; sleep 1
+  # without the trap, Ctrl+C reaches pzctl too and quits the whole panel
+  trap 'echo' INT
+  tail -n 40 -f "$PZ_CONSOLE" 2>/dev/null || echo "No console log yet."
+  trap - INT
+  echo; pause
+}
+
+# ------------------------------------------------------------ mods: shared bits
+active_mods() {
+  local m raw=(); ACTIVE=()
+  m="$(mods_get)"
+  if [ -n "$m" ]; then
+    local IFS=';'; read -ra raw <<< "$m"
+    for m in "${raw[@]}"; do [ -n "$m" ] && ACTIVE+=("$m"); done
+  fi
+}
+disabled_mods() { DISABLED=(); [ -f "$PZ_DISABLED" ] && mapfile -t DISABLED < <(grep . "$PZ_DISABLED" || true); }
+# mods sitting in the mods folder that are in neither list: manually copied in,
+# or left behind by a removal. They do nothing until they are enabled.
+orphan_mods() {
+  ORPHAN=(); local m known=";$(mods_get);"
+  [ -f "$PZ_DISABLED" ] && known="$known$(tr '\n' ';' < "$PZ_DISABLED");"
+  while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    case "$known" in *";$m;"*) : ;; *) ORPHAN+=("$m") ;; esac
+  done < <(disk_mod_ids)
+}
+
+print_mod_list() {   # sets ACTIVE/DISABLED/ORPHAN, numbered continuously
+  active_mods; disabled_mods; orphan_mods
+  local i=1 m
+  if [ ${#ACTIVE[@]} -eq 0 ] && [ ${#DISABLED[@]} -eq 0 ] && [ ${#ORPHAN[@]} -eq 0 ]; then echo "  (no mods)"; return; fi
+  for m in "${ACTIVE[@]}"; do printf '  %2d) %s\n' "$i" "$m"; i=$((i+1)); done
+  for m in "${DISABLED[@]}"; do printf '  %2d) %s %s\n' "$i" "$(ylw '[off]')" "$m"; i=$((i+1)); done
+  for m in "${ORPHAN[@]}"; do printf '  %2d) %s %s\n' "$i" "$(ylw '[on disk, not in the list]')" "$m"; i=$((i+1)); done
+  [ ${#ORPHAN[@]} -gt 0 ] && echo "      ${#ORPHAN[@]} mod(s) are installed but not loaded — use $(bold 'Disable / enable') to switch them on."
+}
+
+# expand "2 5 7-9" into validated ascending unique indices (1..$2)
+parse_selection() {
+  local t a b
+  for t in $1; do
+    if [[ "$t" =~ ^[0-9]+-[0-9]+$ ]]; then a="${t%-*}"; b="${t#*-}"; [ "$a" -le "$b" ] && seq "$a" "$b"
+    elif [[ "$t" =~ ^[0-9]+$ ]]; then echo "$t"; fi
+  done | sort -nu | awk -v m="$2" '$1>=1 && $1<=m'
+}
+
+save_active() {  # save_active "${ARR[@]}"
+  local IFS=';'; mods_set "$*"
+}
+save_disabled() {
+  : > "$PZ_DISABLED.pztmp"
+  local m; for m in "$@"; do printf '%s\n' "$m" >> "$PZ_DISABLED.pztmp"; done
+  mv "$PZ_DISABLED.pztmp" "$PZ_DISABLED"; fix_owner "$PZ_DISABLED"
+}
+
+# ------------------------------------------------------------ mods: actions
+do_add_mod() {
+  echo "$(bold 'Add a mod or collection') — paste a Workshop URL or ID."
+  echo "  single mod:  ...filedetails/?id=3713362869"
+  echo "  collection:  ...filedetails/?id=2903157839   (installs every mod in it)"
+  local raw id; local -a ids=()
+  if ! dd_ready; then
+    red "DepotDownloader isn't usable, so no mod can be downloaded."
+    echo "  configured as: ${PZ_DD:-<empty>}"
+    echo "  fix: re-run $(bold 'sudo ./install.sh') from the repo (it reinstalls the downloader)."
+    echo; pause; return
+  fi
+  read -rp '  Workshop URL or ID: ' raw || return
+  id="$(extract_ws_id "$raw")"
+  [ -z "$id" ] && { red "Couldn't find a Workshop ID in that."; echo; pause; return; }
+  # a previous root-run auto-update may have left root-owned mod folders behind
+  ensure_owned "$PZ_MODS" || ylw "Some mod folders belong to another user and sudo isn't available; installs may fail."
+  echo "Checking $(bold "$id") (single mod or collection?)..."
+  mapfile -t ids < <(resolve_ws_ids "$id")
+  local total="${#ids[@]}" coll=no
+  if [ "$total" -gt 1 ]; then coll=yes; echo "$(grn 'Collection') — $(bold "$total") items. Installing as local mods (already-installed ones are skipped)..."; fi
+  # one batched Steam call: gives every item's title + update time, so items that
+  # are already installed and current can be skipped instead of re-downloaded
+  declare -A LIVE TITLE
+  local w t ttl
+  while IFS=$'\t' read -r w t ttl; do LIVE[$w]="$t"; TITLE[$w]="$ttl"; done < <(ws_details "${ids[@]}")
+  local have; have=";$(disk_mod_ids | tr '\n' ';')"
+  local done_mods=0 fail=0 skipped=0 i=0 wid out n row stored live m allthere irc err
+  for wid in "${ids[@]}"; do
+    i=$((i+1))
+    row="$(manifest_row "$wid")"; stored="$(printf '%s' "$row" | cut -f2)"
+    live="${LIVE[$wid]:-0}"
+    if [ -n "$row" ] && [ "${live:-0}" -gt 0 ] 2>/dev/null && [ "${stored:-0}" -ge "$live" ] 2>/dev/null; then
+      allthere=1
+      while IFS= read -r m; do
+        [ -z "$m" ] && continue
+        case "$have" in *";$m;"*) : ;; *) allthere=0 ;; esac
+      done < <(printf '%s' "$row" | cut -f3 | tr ',' '\n')
+      if [ "$allthere" = 1 ]; then
+        skipped=$((skipped+1))
+        if [ "$coll" = yes ]; then printf '  [%d/%d] %s ... %s\n' "$i" "$total" "$wid" "$(ylw 'already installed — skipped')"
+        else echo "  $(ylw 'Already installed and up to date:') $(printf '%s' "$row" | cut -f4)"; fi
+        continue
+      fi
+    fi
+    [ "$coll" = yes ] && printf '  [%d/%d] %s ... ' "$i" "$total" "$wid"
+    pz_err_clear
+    out="$(install_workshop_item "$wid" "${LIVE[$wid]:-}" "${TITLE[$wid]:-}")"; irc=$?
+    err="$(pz_err_get)"
+    if [ -z "$out" ]; then
+      fail=$((fail+1))
+      # say WHY: a bare "failed" is impossible to act on
+      if [ "$coll" = yes ]; then echo "$(red 'failed') — ${err:-unknown error}"
+      else red "Install failed: ${err:-unknown error}"; echo; fi
+      continue
+    fi
+    n="$(printf '%s\n' "$out" | grep -c .)"; done_mods=$((done_mods+n))
+    if [ "$irc" != 0 ]; then
+      fail=$((fail+1))
+      [ "$coll" = yes ] && echo "$(ylw 'partial') ($n) — ${err:-see the log}" || ylw "Partly installed ($n): ${err:-see the log}"
+      continue
+    fi
+    if [ "$coll" = yes ]; then echo "$(grn ok) ($n)"; else printf '%s\n' "$out" | sed "s/^/  $(grn +) installed mod: /"; fi
+  done
+  fix_owner "$PZ_MODS" "$PZ_INI"
+  echo
+  if [ "$done_mods" -eq 0 ] && [ "$skipped" -eq 0 ]; then
+    red "Nothing installed (download failed or no mod.info found)."; echo; pause; return
+  fi
+  echo "$(grn "Done — $done_mods mod(s) added as local mods.")$( [ "$skipped" -gt 0 ] && printf ' %s' "$(ylw "($skipped already installed)")")$( [ "$fail" -gt 0 ] && printf ' %s' "$(red "($fail failed)")")"
+  n="$(maps_append_missing)"
+  [ "$n" -gt 0 ] 2>/dev/null && echo "$(grn "Map mod(s) detected — added $n map(s) to Map=") (base map kept last)."
+  echo "$(ylw 'IMPORTANT:') local mods aren't auto-downloaded — every player must $(bold subscribe) on the Workshop:"
+  echo "           https://steamcommunity.com/sharedfiles/filedetails/?id=$id"
+  [ "$coll" = yes ] && echo "           (it's a collection — players can subscribe to it once to get all $total.)"
+  echo "Restart the server to load them (main menu, option 3)."
+  pause
+}
+
+do_remove_mods() {
+  print_mod_list
+  local listed=$(( ${#ACTIVE[@]} + ${#DISABLED[@]} ))
+  local total=$(( listed + ${#ORPHAN[@]} ))
+  [ "$total" -eq 0 ] && { pause; return; }
+  echo
+  local input; read -rp 'Numbers to REMOVE, e.g. "2 5 7-9" (Enter to cancel): ' input || return
+  [ -z "$input" ] && return
+  local -a picks=(); mapfile -t picks < <(parse_selection "$input" "$total")
+  [ ${#picks[@]} -eq 0 ] && { red "No valid numbers in that."; echo; pause; return; }
+  local skipped_orphan=0 p2
+  for p2 in "${picks[@]}"; do [ "$p2" -gt "$listed" ] && skipped_orphan=$((skipped_orphan+1)); done
+  [ "$skipped_orphan" -gt 0 ] && ylw "Skipped $skipped_orphan entry(ies) that are only on disk (nothing to remove from the list)." && echo
+  local -a newA=() newD=(); local i=1 m keep p removed=0
+  for m in "${ACTIVE[@]}" "${DISABLED[@]}"; do
+    keep=1
+    for p in "${picks[@]}"; do [ "$p" = "$i" ] && keep=0 && break; done
+    if [ "$keep" = 1 ]; then
+      if [ "$i" -le ${#ACTIVE[@]} ]; then newA+=("$m"); else newD+=("$m"); fi
+    else removed=$((removed+1)); fi
+    i=$((i+1))
+  done
+  save_active "${newA[@]}"; save_disabled "${newD[@]}"; manifest_prune
+  echo "$(grn "Removed $removed mod(s) from the list.") (Files kept in $PZ_MODS.) Restart to apply."
+  pause
+}
+
+do_remove_all() {
+  active_mods; disabled_mods
+  local total=$(( ${#ACTIVE[@]} + ${#DISABLED[@]} ))
+  [ "$total" -eq 0 ] && { echo "  (no mods to remove)"; pause; return; }
+  local a; read -rp "Remove ALL $total mod(s) from the server? Files are kept. Type yes: " a || return
+  [ "$a" = yes ] || { echo "Cancelled."; pause; return; }
+  save_active; save_disabled; manifest_prune
+  echo "$(grn 'All mods removed from the active/disabled lists.') Restart to apply."
+  pause
+}
+
+do_reorder() {
+  active_mods
+  [ ${#ACTIVE[@]} -lt 2 ] && { echo "Need at least 2 active mods to reorder."; pause; return; }
+  echo "$(bold 'Load order') (top loads first; later mods override earlier ones):"
+  local i=1 m; for m in "${ACTIVE[@]}"; do printf '  %2d) %s\n' "$i" "$m"; i=$((i+1)); done
+  echo
+  echo "  Enter a full new order, e.g. \"3 1 2\"; or a single move, e.g. \"5>1\""
+  echo "  (repeat as often as you like; Enter saves and exits)"
+  local n=${#ACTIVE[@]} input
+  while :; do
+    read -rp '  order> ' input || break
+    [ -z "$input" ] && break
+    if [[ "$input" == *'>'* ]]; then
+      # string ops, not regex: '\>' means word-boundary in some regex engines
+      local from="${input%%>*}" to="${input##*>}" okmv=1
+      [ "$from>$to" = "$input" ] || okmv=0
+      [ -n "$from" ] && [ -n "$to" ] || okmv=0
+      case "$from$to" in *[!0-9]*) okmv=0 ;; esac
+      if [ "$okmv" = 1 ] && [ "$from" -ge 1 ] && [ "$from" -le "$n" ] && [ "$to" -ge 1 ] && [ "$to" -le "$n" ]; then
+        local mv="${ACTIVE[$((from-1))]}"; local -a rest=()
+        for i in "${!ACTIVE[@]}"; do [ "$i" != $((from-1)) ] && rest+=("${ACTIVE[$i]}"); done
+        ACTIVE=("${rest[@]:0:$((to-1))}" "$mv" "${rest[@]:$((to-1))}")
+      else red "Moves look like \"5>1\" with numbers 1..$n."; echo; fi
+    else
+      local -a order=(); mapfile -t order < <(parse_selection "$input" "$n")
+      if [ ${#order[@]} -eq "$n" ]; then
+        local -a neworder=(); local p
+        # parse_selection sorts; re-parse in user order instead
+        neworder=(); for p in $input; do [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "$n" ] && neworder+=("${ACTIVE[$((p-1))]}"); done
+        if [ ${#neworder[@]} -eq "$n" ]; then ACTIVE=("${neworder[@]}")
+        else red "A full order must list every number exactly once (1..$n)."; echo; fi
+      else red "A full order must list every number exactly once (1..$n), or use \"from>to\"."; echo; fi
+    fi
+    local j=1; for m in "${ACTIVE[@]}"; do printf '  %2d) %s\n' "$j" "$m"; j=$((j+1)); done
+  done
+  save_active "${ACTIVE[@]}"
+  echo "$(grn 'Order saved.') Restart to apply."
+  pause
+}
+
+do_toggle_mods() {
+  print_mod_list
+  local nA=${#ACTIVE[@]} nD=${#DISABLED[@]}
+  local total=$(( nA + nD + ${#ORPHAN[@]} ))
+  [ "$total" -eq 0 ] && { pause; return; }
+  echo
+  echo "Disabled mods stay installed but are taken out of Mods= (players don't need them)."
+  echo "Entries marked $(ylw '[on disk, not in the list]') get switched on the same way."
+  local input; read -rp 'Numbers to toggle on/off, e.g. "2 5 7-9" (Enter to cancel): ' input || return
+  [ -z "$input" ] && return
+  local -a picks=(); mapfile -t picks < <(parse_selection "$input" "$total")
+  [ ${#picks[@]} -eq 0 ] && { red "No valid numbers in that."; echo; pause; return; }
+  local -a newA=("${ACTIVE[@]}") newD=("${DISABLED[@]}"); local p m
+  # collect names first (indices shift once we start moving things)
+  local -a toDisable=() toEnable=()
+  for p in "${picks[@]}"; do
+    if [ "$p" -le "$nA" ]; then toDisable+=("${ACTIVE[$((p-1))]}")
+    elif [ "$p" -le $(( nA + nD )) ]; then toEnable+=("${DISABLED[$((p-nA-1))]}")
+    else toEnable+=("${ORPHAN[$((p-nA-nD-1))]}"); fi
+  done
+  for m in "${toDisable[@]}"; do
+    local -a tmp=(); local x
+    for x in "${newA[@]}"; do [ "$x" != "$m" ] && tmp+=("$x"); done
+    newA=("${tmp[@]}"); newD+=("$m")
+  done
+  for m in "${toEnable[@]}"; do
+    local -a tmp=(); local x
+    for x in "${newD[@]}"; do [ "$x" != "$m" ] && tmp+=("$x"); done
+    newD=("${tmp[@]}"); newA+=("$m")
+  done
+  save_active "${newA[@]}"; save_disabled "${newD[@]}"
+  echo "$(grn "Toggled ${#picks[@]} mod(s).") ${#toDisable[@]} disabled, ${#toEnable[@]} re-enabled. Restart to apply."
+  pause
+}
+
+do_import_ini() {
+  echo "$(bold 'Import mods + settings from another server.ini')"
+  echo "  Reads Mods=, WorkshopItems= and (optionally) the other settings from a foreign ini,"
+  echo "  downloads its workshop items as local mods, and applies the mod order here."
+  local src; read -rp '  Path or URL of the ini: ' src || return
+  [ -z "$src" ] && return
+  local tmp="" file="$src"
+  if [[ "$src" =~ ^https?:// ]]; then
+    tmp="$(mktemp)"; file="$tmp"
+    curl -fsSL --max-time 30 "$src" -o "$file" || { red "Download failed."; rm -f "$tmp"; echo; pause; return; }
+  fi
+  [ -f "$file" ] || { red "File not found: $file"; echo; pause; return; }
+  local fMods fWI
+  fMods="$(ini_get Mods "$file")"; fWI="$(ini_get WorkshopItems "$file")"
+  if [ -z "$fMods" ] && [ -z "$fWI" ]; then
+    red "That file has no Mods= or WorkshopItems= lines."; echo
+    [ -n "$tmp" ] && rm -f "$tmp"
+    pause; return
+  fi
+  cp "$PZ_INI" "$PZ_INI.bak.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+
+  # 1) install its workshop items as LOCAL mods (same policy as add-mod: never WorkshopItems=)
+  local -a wids=(); local wid ok=0 fail=0 i=0
+  if [ -n "$fWI" ]; then local IFS=';'; read -ra wids <<< "$fWI"; unset IFS; fi
+  if [ ${#wids[@]} -gt 0 ]; then
+    echo "Foreign ini references ${#wids[@]} workshop item(s); installing as local mods..."
+    for wid in "${wids[@]}"; do
+      wid="$(extract_ws_id "$wid")"; [ -z "$wid" ] && continue
+      i=$((i+1)); printf '  [%d/%d] %s ... ' "$i" "${#wids[@]}" "$wid"
+      if install_workshop_item "$wid" >/dev/null; then ok=$((ok+1)); echo "$(grn ok)"; else fail=$((fail+1)); echo "$(red failed)"; fi
+    done
+  fi
+
+  # 2) apply the foreign mod order, dropping ids we don't actually have on disk
+  if [ -n "$fMods" ]; then
+    local -a fArr=() have=() final=() dropped=()
+    local IFS=';'; read -ra fArr <<< "$fMods"; unset IFS
+    mapfile -t have < <(find "$PZ_MODS" -maxdepth 3 -name mod.info -exec grep -h '^id=' {} + 2>/dev/null | cut -d= -f2- | tr -d '\r' | sort -u)
+    local m h found
+    for m in "${fArr[@]}"; do
+      [ -z "$m" ] && continue
+      found=0
+      for h in "${have[@]}"; do [ "$m" = "$h" ] && found=1 && break; done
+      [ "$found" = 1 ] && final+=("$m") || dropped+=("$m")
+    done
+    save_active "${final[@]}"
+    echo "$(grn "Mod list applied: ${#final[@]} mod(s) in the foreign order.")"
+    [ ${#dropped[@]} -gt 0 ] && echo "$(ylw "Dropped ${#dropped[@]} id(s) not installed locally:") ${dropped[*]}"
+  fi
+
+  # 3) optionally copy the rest of the settings (identity/network keys never copied:
+  #    ports, passwords, ServerPlayerID, ResetID, Seed, SteamVAC, announced ip, ...)
+  local a; read -rp 'Also copy the OTHER settings (name, pvp, loot, etc.)? Ports/identity are kept. [y/N]: ' a || a=""
+  if [[ "$a" =~ ^[Yy] ]]; then
+    local line key val n=0
+    while IFS= read -r line; do
+      line="${line%$'\r'}"
+      [[ "$line" =~ ^[A-Za-z0-9_.]+= ]] || continue
+      key="${line%%=*}"; val="${line#*=}"
+      [[ "$PZ_INI_PRESERVE" == *" $key "* ]] && continue
+      ini_set "$key" "$val"; n=$((n+1))
+    done < "$file"
+    echo "$(grn "Copied $n setting(s).") Network/identity keys kept from your current config."
+  fi
+
+  # 4) map list: keep the foreign ORDER, but only for maps that exist here
+  #    (in an active mod or the vanilla game); the base map always goes last
+  local fMap; fMap="$(ini_get Map "$file")"
+  if [ -n "$fMap" ]; then
+    local -a fm=() kept=() mdropped=()
+    local IFS=';'; read -ra fm <<< "$fMap"; unset IFS
+    local avail v
+    avail=";$(maps_available_for_active | tr '\n' ';')"
+    for v in "$PZ_INSTALL"/media/maps/*/; do [ -d "$v" ] && avail="$avail$(basename "$v");"; done
+    for m in "${fm[@]}"; do
+      [ -z "$m" ] && continue
+      [ "$m" = "$PZ_BASEMAP" ] && continue
+      case "$avail" in *";$m;"*) kept+=("$m") ;; *) mdropped+=("$m") ;; esac
+    done
+    local mline=""
+    for m in "${kept[@]}"; do mline="${mline:+$mline;}$m"; done
+    mline="${mline:+$mline;}$PZ_BASEMAP"
+    map_set "$mline"
+    echo "$(grn "Map list applied: ${#kept[@]} map(s) + base map last.")"
+    [ ${#mdropped[@]} -gt 0 ] && echo "$(ylw "Dropped ${#mdropped[@]} map(s) not installed here:") ${mdropped[*]}"
+  else
+    n="$(maps_append_missing)"
+    [ "$n" -gt 0 ] 2>/dev/null && echo "Added $n map(s) from the imported mods to Map=."
+  fi
+  fix_owner "$PZ_INI" "$PZ_MODS"; manifest_prune
+  [ -n "$tmp" ] && rm -f "$tmp"
+  echo "A backup of your previous ini is next to it (*.bak.*). Restart to apply."
+  pause
+}
+
+mods_menu() {
+  while :; do
+    clear 2>/dev/null || true
+    echo "$(bold '  Mods  —  pzctl')"
+    echo "  ------------------------------------------"
+    print_mod_list
+    echo "  ------------------------------------------"
+    echo "   1) Add mod / collection     6) Import from another server.ini"
+    echo "   2) Remove (multi)           7) Check for updates"
+    echo "   3) Remove ALL               8) Apply updates now"
+    echo "   4) Reorder                  9) Maps: rebuild Map= from mods"
+    echo "   5) Disable / enable         0) Back"
+    echo
+    local c; read -rp '  > ' c || return
+    case "$c" in
+      1) do_add_mod ;;  2) do_remove_mods ;; 3) do_remove_all ;; 4) do_reorder ;;
+      5) do_toggle_mods ;; 6) do_import_ini ;;
+      7) "$PZ_MODUPDATE" check; pause ;;
+      8) "$PZ_MODUPDATE" apply; pause ;;
+      9)
+        echo "Rebuilding Map= from active mods (custom maps first, base map last)..."
+        echo "  Map=$(maps_rebuild)" | cut -c1-220
+        echo "$(grn 'Saved.') Restart to apply."
+        pause ;;
+      0|q|Q) return ;;
+      *) : ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------ RCON console
+enable_rcon() {
+  [ -f "$PZ_INI" ] || { red "No server ini yet — start the server once first."; echo; return 1; }
+  echo "Enabling RCON (local admin interface on TCP port ${PZ_RCONPORT}; not opened in any firewall)..."
+  local pw; pw="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)"
+  ini_set RCONPassword "$pw"
+  ini_set RCONPort "$PZ_RCONPORT"
+  fix_owner "$PZ_INI"
+  echo "$(grn 'RCON enabled in the ini.') Takes effect after a restart."
+  local a; read -rp 'Restart now? [Y/n]: ' a || a=n
+  [[ "$a" =~ ^[Nn] ]] || run_boot_retry
+}
+
+do_console() {
+  if ! rcon_ready; then
+    echo "The admin console talks to the server over RCON, which isn't enabled yet."
+    local a; read -rp 'Enable it now? [Y/n]: ' a || a=n
+    [[ "$a" =~ ^[Nn] ]] && return
+    enable_rcon || { pause; return; }
+    rcon_ready || { pause; return; }
+  fi
+  echo
+  echo "$(bold 'Admin console (RCON).') Useful: players, servermsg \"text\", save, help."
+  echo "Type $(bold exit) to leave. $(ylw 'Note:') the game command $(bold quit) stops the server;"
+  echo "systemd restarts it automatically, so worst case = a restart."
+  local cmd out
+  while :; do
+    read -rp "$(bold 'RCON> ')" cmd || break
+    case "$cmd" in
+      exit|EXIT) break ;;
+      '') continue ;;
+      quit)
+        local a; read -rp 'This stops the server (systemd will boot it again). Send anyway? [y/N]: ' a || a=n
+        [[ "$a" =~ ^[Yy] ]] || continue ;;
+    esac
+    if out="$(rcon_cmd "$cmd")"; then
+      [ -n "$out" ] && printf '%s\n' "$out" || echo "(ok)"
+    else
+      red "RCON call failed (server booting? wrong state?). Try again in a moment."; echo
+    fi
+  done
+}
+
+# ------------------------------------------------------------ settings / backup / reset / sandbox
+do_settings() {
+  echo "$(bold 'Settings') — Enter to keep the current value."
+  local pn mp jp ram
+  pn="$(ini_get PublicName)"; mp="$(ini_get MaxPlayers)"; jp="$(ini_get Password)"
+  ram="$(grep -oE '"-Xmx[0-9]+g"' "$PZ_JSON" 2>/dev/null | grep -oE '[0-9]+')"
+  local nPn nMp nJp nRam
+  read -rp "  Server name shown in browser [$pn]: " nPn || return; nPn="${nPn:-$pn}"
+  read -rp "  Max players [$mp]: " nMp || return; nMp="${nMp:-$mp}"
+  read -rp "  Join password [${jp:-none}]: " nJp || return; nJp="${nJp:-$jp}"
+  read -rp "  RAM in GB [$ram]: " nRam || return; nRam="${nRam:-$ram}"
+  [ -n "$nPn" ] && ini_set PublicName "$nPn"
+  [[ "$nMp" =~ ^[0-9]+$ ]] && ini_set MaxPlayers "$nMp"
+  ini_set Password "$nJp"
+  if [[ "$nRam" =~ ^[0-9]+$ ]] && [ "$nRam" -ge 2 ]; then
+    sed -i "s|\"-Xmx[0-9]*g\"|\"-Xmx${nRam}g\"|" "$PZ_JSON"
+  elif [ -n "$nRam" ] && [ "$nRam" != "$ram" ]; then
+    echo "$(ylw "'$nRam' isn't a valid GB amount; RAM left at ${ram}G.")"
+  fi
+  fix_owner "$PZ_INI" "$PZ_JSON"
+  echo "$(grn Saved). Restart the server to apply."
+  pause
+}
+
+do_backup_now() {
+  echo "Backing up world + config (server settings, saves, player database)..."
+  local out; out="$(backup_world "$PZ_BACKUPS" pzbackup)"
+  if [ -z "$out" ]; then red "Nothing to back up yet (no world data)."; return 1; fi
+  cp "$PZ_JSON" "$PZ_BACKUPS/ProjectZomboid64_$(date +%Y%m%d_%H%M%S).json" 2>/dev/null || true
+  fix_owner "$PZ_BACKUPS"
+  echo "$(grn 'Saved') to $out ($(du -h "$out" 2>/dev/null | cut -f1))"
+}
+
+backups_menu() {
+  local -a BK=()
+  while :; do
+    clear 2>/dev/null || true
+    echo "$(bold '  Backups  —  pzctl')"
+    echo "  ------------------------------------------"
+    mapfile -t BK < <(backup_list)
+    local line f kind i=1
+    if [ ${#BK[@]} -eq 0 ]; then
+      echo "  (no backups yet)"
+    else
+      for line in "${BK[@]}"; do
+        f="${line%%$'\t'*}"; kind="${line##*$'\t'}"
+        printf '  %2d) %s  %7s  %s\n' "$i" \
+          "$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')" \
+          "$(du -h "$f" 2>/dev/null | cut -f1)" "$kind"
+        i=$((i+1))
+      done
+    fi
+    echo "  ------------------------------------------"
+    echo "  Folder: $PZ_BACKUPS  ($(du -sh "$PZ_BACKUPS" 2>/dev/null | cut -f1 || echo '0') used)"
+    echo "  Each archive holds server settings, saves and the player database."
+    echo
+    echo "   c) Create a backup now       r) Restore a backup"
+    echo "   d) Delete a backup           0) Back"
+    echo
+    local c pick a
+    read -rp '  > ' c || return
+    case "$c" in
+      c|C) echo; do_backup_now; pause ;;
+      r|R)
+        [ ${#BK[@]} -eq 0 ] && { echo "Nothing to restore."; pause; continue; }
+        read -rp '  Number to restore (Enter to cancel): ' pick || continue
+        [ -z "$pick" ] && continue
+        [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le ${#BK[@]} ] || { red "Out of range."; echo; pause; continue; }
+        f="${BK[$((pick-1))]%%$'\t'*}"
+        echo
+        echo "$(ylw 'This replaces the current world, server settings and player database')"
+        echo "with the contents of:"
+        echo "  $f"
+        echo "The server will be stopped, and your current world is backed up first."
+        read -rp 'Type RESTORE to proceed: ' a || continue
+        [ "$a" = RESTORE ] || { echo "Cancelled."; pause; continue; }
+        echo "  saving the current world as a pre-restore backup..."
+        backup_world "$PZ_BACKUPS" prerestore >/dev/null
+        echo "  stopping the server..."
+        sudo systemctl stop "$PZ_SERVICE"
+        if backup_restore "$f"; then
+          echo "$(grn 'Restored.')"
+          read -rp 'Start the server now? [Y/n]: ' a || a=Y
+          [[ "$a" =~ ^[Nn] ]] || run_boot_retry
+        else
+          red "Restore failed (unreadable archive?). Your data was left as it was."; echo
+        fi
+        pause ;;
+      d|D)
+        [ ${#BK[@]} -eq 0 ] && { echo "Nothing to delete."; pause; continue; }
+        read -rp '  Number to DELETE (Enter to cancel): ' pick || continue
+        [ -z "$pick" ] && continue
+        [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le ${#BK[@]} ] || { red "Out of range."; echo; pause; continue; }
+        f="${BK[$((pick-1))]%%$'\t'*}"
+        read -rp "Delete $(basename "$f")? [y/N]: " a || continue
+        [[ "$a" =~ ^[Yy] ]] && { rm -f "$f" && echo "$(grn Deleted)."; } || echo "Cancelled."
+        pause ;;
+      0|q|Q) return ;;
+      *) : ;;
+    esac
+  done
+}
+
+do_world_reset() {
+  echo "$(bold 'World reset') — deletes the map state and player data of '$PZ_SERVERNAME'."
+  echo "  Kept:    server settings (ini), sandbox settings, installed mods"
+  echo "  Deleted: $PZ_CACHEDIR/Saves/Multiplayer/${PZ_SERVERNAME}*"
+  echo "           $PZ_CACHEDIR/db/${PZ_SERVERNAME}.db (player accounts)"
+  echo
+  local a; read -rp "Type RESET to proceed (anything else cancels): " a || return
+  [ "$a" = RESET ] || { echo "Cancelled."; pause; return; }
+  read -rp 'Back up the world first? [Y/n]: ' a || a=Y
+  if ! [[ "$a" =~ ^[Nn] ]]; then
+    echo "  backing up..."; backup_world "$PZ_BACKUPS" prereset >/dev/null
+    echo "  $(grn done) (prefix 'prereset' in $PZ_BACKUPS)"
+  fi
+  echo "Stopping the server..."
+  sudo systemctl stop "$PZ_SERVICE"
+  rm -rf "$PZ_CACHEDIR/Saves/Multiplayer/${PZ_SERVERNAME}"* 2>/dev/null
+  rm -f  "$PZ_CACHEDIR/db/${PZ_SERVERNAME}.db" 2>/dev/null
+  # a fresh world needs a fresh ResetID (old characters must not carry over), and
+  # ServerPlayerID must never be empty — clients stall on join without it
+  ini_set ResetID "$(( (RANDOM * 32768 + RANDOM) + 1000000 ))"
+  [ -z "$(ini_get ServerPlayerID)" ] && ini_set ServerPlayerID "$(( (RANDOM * 32768 + RANDOM) + 1000000 ))"
+  fix_owner "$PZ_INI"
+  echo "$(grn 'World wiped.') A fresh world generates on the next boot."
+  read -rp 'Start the server now? [Y/n]: ' a || a=Y
+  [[ "$a" =~ ^[Nn] ]] || run_boot_retry
+  pause
+}
+
+do_sandbox() {
+  local f="$PZ_CACHEDIR/Server/${PZ_SERVERNAME}_SandboxVars.lua"
+  [ -f "$f" ] || { echo "No sandbox file yet ($f). Start the server once to generate it."; pause; return; }
+  echo "$(bold 'Sandbox settings') — $f"
+  echo "   1) Edit in ${EDITOR:-nano} (a timestamped backup is written first)"
+  echo "   2) Restore the most recent backup"
+  echo "   0) Back"
+  echo "  Tip: the in-game admin panel edits these with a full UI (log in as admin)."
+  local c; read -rp '  > ' c || return
+  case "$c" in
+    1)
+      local bak="$f.bak.$(date +%Y%m%d_%H%M%S)"
+      cp "$f" "$bak" && echo "Backup: $bak"
+      ${EDITOR:-nano} "$f"
+      fix_owner "$f"
+      echo "$(grn 'Saved.') Restart the server to apply."
+      ;;
+    2)
+      local last; last="$(ls -1t "$f".bak.* 2>/dev/null | head -1)"
+      [ -z "$last" ] && { echo "No backups found."; pause; return; }
+      cp "$last" "$f"; fix_owner "$f"
+      echo "$(grn "Restored") $last. Restart the server to apply."
+      ;;
+  esac
+  pause
+}
+
+# ------------------------------------------------------------ mod-update settings
+do_update_settings() {
+  while :; do
+    clear 2>/dev/null || true
+    local auto sched onres emin keep rcon
+    auto="$(conf_get MODUPDATE_AUTO 0)"; sched="$(conf_get MODUPDATE_SCHED daily)"
+    onres="$(conf_get MODUPDATE_ON_RESTART 0)"; emin="$(conf_get MODUPDATE_EMPTY_MIN 60)"
+    keep="$(conf_get MODUPDATE_BACKUP_KEEP 2)"
+    rcon_ready && rcon="$(grn enabled)" || rcon="$(red disabled)"
+    echo "$(bold '  Workshop mod updates  —  pzctl')"
+    echo "  ------------------------------------------"
+    echo "  Tracked items: $(manifest_ids | wc -l)   RCON: $rcon"
+    echo "  ------------------------------------------"
+    echo "   1) Scheduled auto-update:   $( [ "$auto" = 1 ] && grn ON || red OFF )"
+    echo "   2) Check cadence:           $sched"
+    echo "   3) Check on every restart:  $( [ "$onres" = 1 ] && grn ON || red OFF )"
+    echo "   4) Apply when empty for:    $emin min"
+    echo "   5) Pre-update backups kept: $keep"
+    echo "   6) Check for updates now"
+    echo "   7) Apply updates now"
+    echo "   8) Show the update log"
+    echo "   0) Back"
+    echo
+    echo "  How auto-update works: a timer checks $sched; when updates exist it waits"
+    echo "  until the server has been empty for $emin min, backs the world up, updates,"
+    echo "  and restarts. Needs RCON (for the player count) — enabled automatically."
+    local c; read -rp '  > ' c || return
+    case "$c" in
+      1)
+        if [ "$auto" = 1 ]; then conf_set MODUPDATE_AUTO 0
+        else
+          conf_set MODUPDATE_AUTO 1
+          rcon_ready || enable_rcon
+        fi ;;
+      2) [ "$sched" = daily ] && conf_set MODUPDATE_SCHED weekly || conf_set MODUPDATE_SCHED daily ;;
+      3) [ "$onres" = 1 ] && conf_set MODUPDATE_ON_RESTART 0 || conf_set MODUPDATE_ON_RESTART 1 ;;
+      4)
+        local v; read -rp '  Minutes the server must be empty (0 = update immediately): ' v || continue
+        [[ "$v" =~ ^[0-9]+$ ]] && conf_set MODUPDATE_EMPTY_MIN "$v" || { red "Not a number."; echo; pause; } ;;
+      5)
+        local v; read -rp '  Backups to keep in the mod-update folder (0-3, 0 = no backups): ' v || continue
+        [[ "$v" =~ ^[0-3]$ ]] && conf_set MODUPDATE_BACKUP_KEEP "$v" || { red "Pick 0, 1, 2 or 3."; echo; pause; } ;;
+      6) "$PZ_MODUPDATE" check; pause ;;
+      7) "$PZ_MODUPDATE" apply; pause ;;
+      8) echo; tail -n 30 "$PZ_UPDATELOG" 2>/dev/null || echo "(log is empty)"; pause ;;
+      0|q|Q) return ;;
+      *) : ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------ menu loop
+[ -f "$PZ_INI" ] || echo "$(ylw 'Note:') $PZ_INI not found yet — start the server once to generate it."
+while true; do
+  clear 2>/dev/null || true
+  echo "$(bold "  Project Zomboid B42  —  pzctl")$( [ "$PZ_SERVICE" != zomboid-b42 ] && printf ' \033[1;33m[%s]\033[0m' "$PZ_SERVICE" )"
+  echo "  ------------------------------------------"
+  status_line
+  echo "  ------------------------------------------"
+  echo "   1) Start / bring up        7) Admin console (RCON)"
+  echo "   2) Stop                    8) Settings (name/pw/players/RAM)"
+  echo "   3) Restart                 9) Backups (create/restore/delete)"
+  echo "   4) Status & paths         10) World reset"
+  echo "   5) Live logs              11) Sandbox settings"
+  echo "   6) Mods                   12) Mod updates"
+  echo "   0) Exit"
+  echo
+  read -rp '  > ' choice || { echo; exit 0; }
+  case "$choice" in
+    1) do_start ;;   2) do_stop ;;    3) do_restart ;; 4) do_status ;; 5) do_logs ;;
+    6) mods_menu ;;  7) do_console ;; 8) do_settings ;; 9) backups_menu ;;
+    10) do_world_reset ;; 11) do_sandbox ;; 12) do_update_settings ;;
+    0|q|Q) echo "bye."; exit 0 ;;
+    *) : ;;
+  esac
+done
