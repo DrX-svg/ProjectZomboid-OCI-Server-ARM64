@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+
+set -u
+
+CONTAINER="pz-server-fex"
+RCON="/usr/local/sbin/pzrcon.py"
+
+docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true || exit 0
+
+docker exec "$CONTAINER" pgrep -f '[/]ProjectZomboid64' >/dev/null 2>&1 || exit 0
+
+PASSWORD="$(
+    docker exec "$CONTAINER" bash -lc     'grep -m1 "^RCONPassword=" /home/steam/Zomboid/Server/servertest.ini | cut -d= -f2-'
+)"
+
+if [ -n "$PASSWORD" ]; then
+    echo "Saving Project Zomboid world..."
+    RCON_PASSWORD="$PASSWORD" python3 "$RCON" save || true
+
+    sleep 2
+
+    echo "Requesting clean Project Zomboid shutdown..."
+    RCON_PASSWORD="$PASSWORD" python3 "$RCON" quit || true
+fi
+
+unset PASSWORD
+
+for i in $(seq 1 45); do
+    if ! docker exec "$CONTAINER" pgrep -f '[/]ProjectZomboid64' >/dev/null 2>&1; then
+        echo "Project Zomboid stopped cleanly."
+        exit 0
+    fi
+
+    sleep 1
+done
+
+echo "Project Zomboid did not stop within 45 seconds; container cleanup will follow."
+exit 0
