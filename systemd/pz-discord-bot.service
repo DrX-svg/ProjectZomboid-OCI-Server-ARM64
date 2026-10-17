@@ -1,0 +1,20 @@
+[Unit]
+Description=RBX Project Zomboid Discord Bot
+After=network-online.target pz-fex.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pzbot
+Group=pzbot
+WorkingDirectory=/opt/pz-discord-bot
+EnvironmentFile=/etc/pz-discord-bot.env
+ExecStart=/opt/pz-discord-bot/venv/bin/python /opt/pz-discord-bot/bot.py
+Restart=on-failure
+RestartSec=5
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

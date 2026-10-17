@@ -1,0 +1,12 @@
+#!/bin/bash
+set -euo pipefail
+
+CONTAINER="pz-server-fex"
+FILE="/home/steam/Zomboid/Lua/RBXBridge_status.txt"
+
+if ! /usr/bin/docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -qx true; then
+    echo "container_not_running" >&2
+    exit 2
+fi
+
+/usr/bin/docker exec "$CONTAINER" /bin/cat "$FILE"

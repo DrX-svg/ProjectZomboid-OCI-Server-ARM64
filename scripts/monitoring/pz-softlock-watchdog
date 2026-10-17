@@ -1,0 +1,93 @@
+#!/bin/bash
+set -u
+
+STATE=/run/pz-softlock-watchdog.state
+LOGDIR=/var/log/pz-softlock-watchdog
+CONTAINER=pz-server-fex
+
+mkdir -p "$LOGDIR"
+
+armed=0
+fails=0
+
+if [ -f "$STATE" ]; then
+    . "$STATE"
+fi
+
+save_state() {
+    printf 'armed=%s\nfails=%s\n' "$armed" "$fails" > "$STATE"
+}
+
+# Dacă procesul PZ nu există, probabil suntem în startup/shutdown.
+PID="$(
+    docker top "$CONTAINER" -eo pid,args 2>/dev/null |
+    awk '/ProjectZomboid64/ {print $1; exit}'
+)"
+
+if [ -z "$PID" ]; then
+    armed=0
+    fails=0
+    save_state
+    exit 0
+fi
+
+RESULT="$(/usr/local/sbin/pz-bot-query 2>/dev/null || true)"
+
+if printf '%s' "$RESULT" | grep -q '"rcon_ok": true'; then
+    armed=1
+    fails=0
+    save_state
+    exit 0
+fi
+
+# Nu judecăm serverul până nu a avut RCON funcțional după boot.
+if [ "$armed" -ne 1 ]; then
+    exit 0
+fi
+
+fails=$((fails + 1))
+save_state
+
+logger -t pz-watchdog \
+    "RCON failure $fails/3 while ProjectZomboid64 PID=$PID is alive"
+
+if [ "$fails" -lt 3 ]; then
+    exit 0
+fi
+
+STAMP="$(date +%Y%m%d-%H%M%S)"
+DIR="$LOGDIR/$STAMP"
+mkdir -p "$DIR"
+
+{
+    echo "Detected probable PZ soft-lock"
+    date
+    echo
+    echo "PID=$PID"
+    echo
+    echo "RCON:"
+    printf '%s\n' "$RESULT"
+    echo
+    docker top "$CONTAINER" -eo pid,etime,stat,%cpu,%mem,args
+} > "$DIR/status.txt" 2>&1
+
+journalctl -u pz-fex.service \
+    --since "15 minutes ago" \
+    --no-pager > "$DIR/before-thread-dump.log" 2>&1
+
+# JVM thread dump; SIGQUIT does not terminate Java.
+kill -QUIT "$PID" 2>/dev/null || true
+sleep 5
+
+journalctl -u pz-fex.service \
+    --since "2 minutes ago" \
+    --no-pager > "$DIR/thread-dump.log" 2>&1
+
+logger -t pz-watchdog \
+    "Probable soft-lock confirmed after 3 RCON failures; diagnostics=$DIR; restarting pz-fex"
+
+armed=0
+fails=0
+save_state
+
+systemctl restart pz-fex.service

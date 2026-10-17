@@ -1,0 +1,8 @@
+*.sh text eol=lf
+*.py text eol=lf
+*.lua text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+*.patch text eol=lf
+/scripts/admin/* text eol=lf
+/scripts/monitoring/* text eol=lf

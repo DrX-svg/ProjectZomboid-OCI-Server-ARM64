@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+
+import subprocess
+import re
+from datetime import datetime
+
+CONTAINER = "pz-server-fex"
+
+cmd = [
+    "docker", "exec", CONTAINER,
+    "bash", "-lc",
+    r'''find /home/steam/Zomboid/Logs \
+-type f -name "*_connections.txt" \
+-printf "%T@ %p\n" 2>/dev/null |
+sort -nr |
+head -1 |
+cut -d" " -f2-'''
+]
+
+try:
+    logfile = subprocess.check_output(
+        ["sudo"] + cmd,
+        text=True
+    ).strip()
+except Exception as e:
+    print("Nu am putut găsi connection log-ul:", e)
+    raise SystemExit(1)
+
+if not logfile:
+    print("Nu există connection log.")
+    raise SystemExit(1)
+
+try:
+    content = subprocess.check_output(
+        [
+            "sudo", "docker", "exec", CONTAINER,
+            "cat", logfile
+        ],
+        text=True,
+        errors="ignore"
+    )
+except Exception as e:
+    print("Nu am putut citi log-ul:", e)
+    raise SystemExit(1)
+
+active = {}
+
+for line in content.splitlines():
+
+    user_match = re.search(r'username="([^"]+)"', line)
+
+    if not user_match:
+        continue
+
+    username = user_match.group(1)
+
+    if username == "null":
+        continue
+
+    time_match = re.match(
+        r'\[(\d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\]',
+        line
+    )
+
+    if not time_match:
+        continue
+
+    try:
+        timestamp = datetime.strptime(
+            time_match.group(1),
+            "%d-%m-%y %H:%M:%S.%f"
+        )
+    except ValueError:
+        continue
+
+    if 'event="fully-connected"' in line:
+        active[username] = timestamp
+
+    elif (
+        'event="disconnect"' in line
+        and 'message="receive-disconnect"' in line
+    ):
+        active.pop(username, None)
+
+now = datetime.now()
+
+print()
+print("PROJECT ZOMBOID SERVER")
+print("=" * 40)
+print(f"Online: {len(active)}/32")
+print()
+
+if not active:
+    print("Niciun player conectat.")
+else:
+    for username, connected in sorted(
+        active.items(),
+        key=lambda x: x[1]
+    ):
+        seconds = int((now - connected).total_seconds())
+
+        if seconds < 0:
+            duration = "necunoscut"
+        else:
+            days, seconds = divmod(seconds, 86400)
+            hours, seconds = divmod(seconds, 3600)
+            minutes = seconds // 60
+
+            parts = []
+
+            if days:
+                parts.append(f"{days}z")
+            if hours or days:
+                parts.append(f"{hours}h")
+
+            parts.append(f"{minutes}m")
+            duration = " ".join(parts)
+
+        print(f"{username}")
+        print(f"  conectat: {connected:%d-%m-%Y %H:%M:%S}")
+        print(f"  online:   {duration}")
+        print()
+
+print("=" * 40)
+print("Log:", logfile)

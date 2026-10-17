@@ -1,0 +1,23 @@
+[Unit]
+Description=Project Zomboid B42 via FEX
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+Restart=always
+RestartSec=20
+TimeoutStopSec=90
+
+ExecStartPre=-/usr/bin/docker start pz-server-fex
+
+ExecStart=/usr/bin/docker exec --user 1001:1001 pz-server-fex /bin/bash -lc "cd /home/steam/Zomboid && exec /usr/bin/FEXBash ./start-server.sh"
+
+ExecStop=/usr/local/sbin/pz-graceful-stop
+
+ExecStopPost=-/usr/bin/docker kill pz-server-fex
+
+[Install]
+WantedBy=multi-user.target

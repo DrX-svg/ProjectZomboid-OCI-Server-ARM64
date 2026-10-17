@@ -1,0 +1,6 @@
+[Unit]
+Description=Project Zomboid soft-lock watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pz-softlock-watchdog
